@@ -404,7 +404,7 @@ footer {
 
 <footer>
   ⚠ INFORMATIONAL ONLY — NOT FINANCIAL ADVICE &nbsp;|&nbsp;
-  DATA: BINANCE PUBLIC API &nbsp;|&nbsp;
+  DATA: KRAKEN · BINANCE US · COINGECKO &nbsp;|&nbsp;
   PATTERNS: OOS WALK-FORWARD VALIDATED (pattern_paper_trader_overnight.py)<br>
   northern_doji=66.7%WR · bear_engulf=60.5%WR · gravestone_doji=58.9%WR · shooting_star=54.8%WR<br>
   Bull patterns DISABLED — OOS WR &lt;50% means negative EV at 50/50 Polymarket odds
@@ -424,7 +424,15 @@ const BEAR_PATTERNS = {
   "pat_shooting_star_score":   { oos: 0.548, label: "shooting_star",    dir:"DOWN" },
 };
 const QUALITY_MIN    = 0.38;
-const BINANCE        = 'https://api.binance.com';
+// ══════════════════════════════════════════════════════════════
+// DATA SOURCES — all CORS-compatible with github.io
+// Kraken: primary (OHLCV candles, no auth, works everywhere)
+// Binance US: fallback for candles (same format, US-based CORS)
+// CoinGecko: price-only last resort (no candles, 50 calls/min free)
+// ══════════════════════════════════════════════════════════════
+const KRAKEN     = 'https://api.kraken.com/0/public';
+const BINANCE_US = 'https://api.binance.us';
+const COINGECKO  = 'https://api.coingecko.com/api/v3';
 
 // ══════════════════════════════════════════════════════════════
 // STATE
@@ -435,9 +443,8 @@ let signalLog  = [];
 let sigsToday  = 0;
 let lastSignal = null;
 let regime7d   = 0;
-let liveMemory = {};  // pattern -> {live_wins, live_total, oos_wr}
+let liveMemory = {};
 
-// Seed live memory from OOS baselines
 for (const [k, v] of Object.entries(BEAR_PATTERNS)) {
   liveMemory[k] = { live_wins:0, live_total:0, oos_wr:v.oos };
 }
@@ -445,35 +452,94 @@ for (const [k, v] of Object.entries(BEAR_PATTERNS)) {
 // ══════════════════════════════════════════════════════════════
 // DATA FETCHING
 // ══════════════════════════════════════════════════════════════
-async function fetchKlines(interval='5m', limit=120) {
-  try {
-    const r = await fetch(`${BINANCE}/api/v3/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`, {mode:'cors'});
-    if (r.ok) return (await r.json()).map(k=>({open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5]}));
-  } catch(e) {}
+
+// Kraken returns: [time, open, high, low, close, vwap, volume, count]
+// interval=5 means 5-minute candles
+async function _krakenKlines(limit=120) {
+  const r = await fetch(`${KRAKEN}/OHLC?pair=XBTUSD&interval=5`, {mode:'cors'});
+  if (!r.ok) throw new Error('kraken not ok');
+  const d = await r.json();
+  if (d.error && d.error.length) throw new Error(d.error[0]);
+  const raw = d.result['XXBTZUSD'] || d.result[Object.keys(d.result).find(k=>k!=='last')];
+  if (!raw || raw.length < 60) throw new Error('kraken insufficient data');
+  // Kraken returns last 720 5m bars — take last `limit`
+  const rows = raw.slice(-limit);
+  return rows.map(c => ({
+    open: +c[1], high: +c[2], low: +c[3], close: +c[4], volume: +c[6],
+    close_time: (+c[0] + 300) * 1000  // Kraken gives open time, add 5min for close time
+  }));
+}
+
+async function _binanceUsKlines(limit=120) {
+  const r = await fetch(`${BINANCE_US}/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=${limit}`, {mode:'cors'});
+  if (!r.ok) throw new Error('binanceus not ok');
+  const raw = await r.json();
+  if (!raw || raw.length < 60) throw new Error('binanceus insufficient data');
+  return raw.map(k => ({
+    open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
+    close_time: +k[6]
+  }));
+}
+
+async function fetchKlines(limit=120) {
+  try { return await _krakenKlines(limit); } catch(e) {}
+  try { return await _binanceUsKlines(limit); } catch(e) {}
   return simKlines(limit);
 }
 
 async function fetchTicker() {
+  // Kraken ticker
   try {
-    const r = await fetch(`${BINANCE}/api/v3/ticker/24hr?symbol=BTCUSDT`, {mode:'cors'});
-    if (r.ok) { const d = await r.json(); return {price:+d.lastPrice, chg:+d.priceChangePercent}; }
+    const r = await fetch(`${KRAKEN}/Ticker?pair=XBTUSD`, {mode:'cors'});
+    if (r.ok) {
+      const d = await r.json();
+      const t = d.result['XXBTZUSD'] || d.result[Object.keys(d.result)[0]];
+      const price = +t.c[0];  // last trade price
+      const open  = +t.o;     // today's open
+      const chg   = open > 0 ? (price - open) / open * 100 : 0;
+      return { price, chg };
+    }
   } catch(e) {}
-  return {price:btcPrice||97500, chg:0};
+  // Binance US ticker
+  try {
+    const r = await fetch(`${BINANCE_US}/api/v3/ticker/24hr?symbol=BTCUSDT`, {mode:'cors'});
+    if (r.ok) { const d = await r.json(); return { price:+d.lastPrice, chg:+d.priceChangePercent }; }
+  } catch(e) {}
+  // CoinGecko price only
+  try {
+    const r = await fetch(`${COINGECKO}/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true`, {mode:'cors'});
+    if (r.ok) { const d = await r.json(); return { price:+d.bitcoin.usd, chg:+(d.bitcoin.usd_24h_change||0) }; }
+  } catch(e) {}
+  return { price: btcPrice||78000, chg: 0 };
 }
 
 async function fetchRegime() {
+  // Kraken daily OHLC for 7d return
   try {
-    const r = await fetch(`${BINANCE}/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=8`, {mode:'cors'});
+    const r = await fetch(`${KRAKEN}/OHLC?pair=XBTUSD&interval=1440`, {mode:'cors'}); // 1440 = daily
     if (r.ok) {
       const d = await r.json();
-      if(d.length>=7){ const c0=+d[d.length-8][4], c1=+d[d.length-1][4]; return (c1-c0)/c0*100; }
+      const raw = d.result['XXBTZUSD'] || d.result[Object.keys(d.result).find(k=>k!=='last')];
+      if (raw && raw.length >= 7) {
+        const c0 = +raw[raw.length-8]?.[4] || +raw[0][4];
+        const c1 = +raw[raw.length-1][4];
+        return (c1-c0)/c0*100;
+      }
     }
-  } catch(e){}
+  } catch(e) {}
+  // Binance US daily fallback
+  try {
+    const r = await fetch(`${BINANCE_US}/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=8`, {mode:'cors'});
+    if (r.ok) {
+      const d = await r.json();
+      if (d.length >= 7) { const c0=+d[d.length-8][4], c1=+d[d.length-1][4]; return (c1-c0)/c0*100; }
+    }
+  } catch(e) {}
   return 0;
 }
 
 function simKlines(n) {
-  let p=97500+(Math.random()-.5)*2000; const kl=[];
+  let p=btcPrice||78000+(Math.random()-.5)*1000; const kl=[];
   for(let i=0;i<n;i++){
     const o=p,m=(Math.random()-.485)*60,c=o+m;
     kl.push({open:o,high:Math.max(o,c)+Math.random()*25,low:Math.min(o,c)-Math.random()*25,close:c,volume:300+Math.random()*200});
@@ -965,36 +1031,22 @@ function secsIntoWindow() {
 // ── Candle-close event: fetch klines, detect new bar, score once ──
 // ── Fetch with Coinbase fallback then sim fallback ──
 async function fetchKlinesWithCloseTime() {
-  // Try Binance first — returns raw array with close_time in field [6]
+  // Try Kraken first — best CORS support, works from github.io
   try {
-    const r = await fetch(`${BINANCE}/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=120`, {mode:'cors'});
-    if (r.ok) {
-      const raw = await r.json();
-      if (raw && raw.length >= 60) {
-        const kl = raw.map(k=>({open:+k[1],high:+k[2],low:+k[3],close:+k[4],volume:+k[5]}));
-        return { kl, closeTime: raw[raw.length-2][6], source: 'binance' };
-      }
-    }
+    const rows = await _krakenKlines(120);
+    // close_time already set in _krakenKlines
+    const closeTime = rows[rows.length-2].close_time;
+    return { kl: rows, closeTime, source: 'kraken' };
   } catch(e) {}
 
-  // Try Coinbase fallback
+  // Try Binance US fallback
   try {
-    const now = Math.floor(Date.now()/1000);
-    const start = now - 120*300*2;
-    const r = await fetch(`https://api.coinbase.com/api/v3/brokerage/products/BTC-USD/candles?start=${start}&end=${now}&granularity=FIVE_MINUTE`, {mode:'cors'});
-    if (r.ok) {
-      const d = await r.json();
-      const candles = (d.candles || []).sort((a,b)=>+a.start - +b.start).slice(-120);
-      if (candles.length >= 60) {
-        const kl = candles.map(c=>({open:+c.open,high:+c.high,low:+c.low,close:+c.close,volume:+c.volume}));
-        const secsIn = (new Date().getMinutes()%5)*60 + new Date().getSeconds();
-        const lastClose = Math.floor(Date.now()/1000 - secsIn) * 1000;
-        return { kl, closeTime: lastClose, source: 'coinbase' };
-      }
-    }
+    const rows = await _binanceUsKlines(120);
+    const closeTime = rows[rows.length-2].close_time;
+    return { kl: rows, closeTime, source: 'binanceus' };
   } catch(e) {}
 
-  // Sim fallback — chart always visible even with no connectivity
+  // Sim fallback — chart always visible even offline
   const kl = simKlines(120);
   const secsIn = (new Date().getMinutes()%5)*60 + new Date().getSeconds();
   const lastClose = Math.floor(Date.now()/1000 - secsIn) * 1000;
@@ -1002,13 +1054,25 @@ async function fetchKlinesWithCloseTime() {
 }
 
 async function fetchLivePrice() {
+  // Kraken last trade price
   try {
-    const r = await fetch(`${BINANCE}/api/v3/ticker/price?symbol=BTCUSDT`, {mode:'cors'});
+    const r = await fetch(`${KRAKEN}/Ticker?pair=XBTUSD`, {mode:'cors'});
+    if (r.ok) {
+      const d = await r.json();
+      const t = d.result['XXBTZUSD'] || d.result[Object.keys(d.result)[0]];
+      const p = +t.c[0];
+      if (p > 0) return p;
+    }
+  } catch(e) {}
+  // Binance US price
+  try {
+    const r = await fetch(`${BINANCE_US}/api/v3/ticker/price?symbol=BTCUSDT`, {mode:'cors'});
     if (r.ok) { const d = await r.json(); return +d.price; }
   } catch(e) {}
+  // CoinGecko price (slowest but most permissive)
   try {
-    const r = await fetch('https://api.coinbase.com/api/v3/brokerage/products/BTC-USD/ticker?limit=1', {mode:'cors'});
-    if (r.ok) { const d = await r.json(); return +d.trades?.[0]?.price || 0; }
+    const r = await fetch(`${COINGECKO}/simple/price?ids=bitcoin&vs_currencies=usd`, {mode:'cors'});
+    if (r.ok) { const d = await r.json(); return +d.bitcoin.usd; }
   } catch(e) {}
   return btcPrice || 0;
 }
@@ -1031,21 +1095,21 @@ async function onCandleClose() {
     const bannerEl = document.getElementById('connBanner');
     if (statusEl) {
       if (source === 'sim') {
-        statusEl.textContent = '⚠ SIM DATA — VPN/network issue';
+        statusEl.textContent = '⚠ SIM DATA — no live connection';
         statusEl.style.color = 'var(--yellow)';
-        if (bannerEl) { bannerEl.style.display='block'; bannerEl.textContent='⚠ No live data — Binance + Coinbase both failed. Enable VPN and reload.'; }
-      } else if (source === 'coinbase') {
-        statusEl.textContent = `LIVE · COINBASE · ${new Date().toLocaleTimeString()}`;
-        statusEl.style.color = 'var(--yellow)';
-        if (bannerEl) { bannerEl.style.display='block'; bannerEl.textContent='⚠ Binance blocked — using Coinbase. Enable VPN for best reliability.'; }
+        if (bannerEl) { bannerEl.style.display='block'; bannerEl.textContent='⚠ No live data — all sources failed. Check internet connection.'; }
+      } else if (source === 'binanceus') {
+        statusEl.textContent = `LIVE · BINANCE US · ${new Date().toLocaleTimeString()}`;
+        statusEl.style.color = 'var(--green)';
+        if (bannerEl) bannerEl.style.display='none';
       } else {
-        statusEl.textContent = `LIVE · BINANCE · ${new Date().toLocaleTimeString()}`;
+        statusEl.textContent = `LIVE · KRAKEN · ${new Date().toLocaleTimeString()}`;
         statusEl.style.color = 'var(--green)';
         if (bannerEl) bannerEl.style.display='none';
       }
     }
     const dotEl = document.querySelector('.live-dot');
-    if (dotEl) dotEl.style.background = source === 'binance' ? 'var(--green)' : 'var(--yellow)';
+    if (dotEl) dotEl.style.background = source === 'sim' ? 'var(--yellow)' : 'var(--green)';
 
     // Compute signal ONCE
     const sig    = computeSignal(kl);
@@ -1057,12 +1121,9 @@ async function onCandleClose() {
       addLog(sig.bet, sig.confidence, sig.best_pattern);
     }
 
-    // Fetch ticker
-    let ticker = {price: kl[kl.length-2]?.close || 97500, chg: 0};
-    try {
-      const r = await fetch(`${BINANCE}/api/v3/ticker/24hr?symbol=BTCUSDT`);
-      if (r.ok) { const d = await r.json(); ticker = {price:+d.lastPrice, chg:+d.priceChangePercent}; }
-    } catch(e) {}
+    // Fetch ticker using new multi-source fetchTicker()
+    let ticker = {price: kl[kl.length-2]?.close || 78000, chg: 0};
+    try { ticker = await fetchTicker(); } catch(e) {}
     btcPrice = ticker.price;
 
     const win = getWindowState();
